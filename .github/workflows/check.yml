@@ -1,0 +1,39 @@
+name: Check appointment slots
+
+on:
+  schedule:
+    # 13:00 UTC daily (~6am PT / 9am ET). Cron is always UTC.
+    - cron: "0 13 * * *"
+  workflow_dispatch: {}  # lets you trigger manually from the Actions tab
+
+# Avoid overlapping runs if a manual trigger lands on the cron.
+concurrency:
+  group: check-slots
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run slot checker
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python check_slots.py
