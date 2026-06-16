@@ -1,66 +1,84 @@
-"""Unit tests for the slot-parsing logic in check_slots.py.
+"""Unit tests for the day-availability parsing in check_slots.py.
 
-These cover extract_epoch_slots (the network-data path) without needing a
-browser or network access. Run with: python -m pytest -q
+These use the real aria-label formats observed on the live page and need no
+browser or network. Run with: python test_check_slots.py  (or pytest -q)
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date
 
-from check_slots import extract_epoch_slots
+from check_slots import find_open_days, parse_label_date
 
-
-def ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+TODAY = date(2026, 6, 16)  # a Tuesday, matching the live-page snapshot
 
 
-NOW = datetime.now(timezone.utc)
+def labels(*pairs):
+    """Build day-cell labels. Each pair is (text, open?)."""
+    out = []
+    for text, is_open in pairs:
+        suffix = "3 available times" if is_open else "no available times"
+        out.append(f"{text}, {suffix}")
+    return out
 
 
-def test_keeps_timestamps_inside_window():
-    soon = ms(NOW + timedelta(days=2))
-    later = ms(NOW + timedelta(days=5))
-    body = f'[[null,{soon}],[null,{later}]]'
-    assert extract_epoch_slots(body, max_days=7) == {soon, later}
+def test_all_closed_returns_nothing():
+    # Mirrors the live page today: every day says "no available times".
+    lbls = labels(
+        ("16, Tuesday, today", False),
+        ("17, Wednesday", False),
+        ("18, Thursday", False),
+    )
+    assert find_open_days(lbls, TODAY, 7) == []
 
 
-def test_drops_timestamps_beyond_horizon():
-    far = ms(NOW + timedelta(days=120))
-    body = f"[{far}]"
-    assert extract_epoch_slots(body, max_days=90) == set()
+def test_open_day_inside_window_is_found():
+    lbls = labels(
+        ("16, Tuesday, today", False),
+        ("17, Wednesday", False),
+        ("18, Thursday", True),
+    )
+    out = find_open_days(lbls, TODAY, 7)
+    assert [s["date"] for s in out] == [date(2026, 6, 18)]
 
 
-def test_drops_well_past_timestamps():
-    old = ms(NOW - timedelta(days=3))
-    body = f"[{old}]"
-    assert extract_epoch_slots(body, max_days=7) == set()
+def test_open_day_outside_window_ignored():
+    # 'today' at index 0; an open day 10 positions out is beyond a 7-day window.
+    lbls = labels(("16, Tuesday, today", False)) + labels(
+        *[(f"{17 + i}, X", i == 9) for i in range(10)]
+    )
+    assert find_open_days(lbls, TODAY, 7) == []
 
 
-def test_tolerates_slight_tz_skew():
-    # A slot a couple hours "in the past" by UTC clock should still survive the
-    # 6-hour tolerance, covering timezone skew between us and Google's server.
-    skewed = ms(NOW - timedelta(hours=2))
-    assert extract_epoch_slots(f"[{skewed}]", max_days=7) == {skewed}
+def test_anchors_by_today_position_not_label_number():
+    # Even with bare day numbers, position relative to 'today' drives the date.
+    lbls = labels(
+        ("16, Tuesday, today", False),
+        ("17, Wednesday", True),
+    )
+    out = find_open_days(lbls, TODAY, 7)
+    assert out[0]["date"] == date(2026, 6, 17)
 
 
-def test_ignores_non_13_digit_numbers():
-    # 10-digit epoch-seconds and short ids must not be treated as slots.
-    epoch_seconds = str(int((NOW + timedelta(days=1)).timestamp()))  # 10 digits
-    body = f'[42, 1000, {epoch_seconds}, "AcZssZ2G7"]'
-    assert extract_epoch_slots(body, max_days=7) == set()
+def test_non_day_cells_ignored():
+    lbls = ["Next month", "Previous day"] + labels(("18, Thursday", True))
+    # No 'today' cell here -> falls back to parse_label_date for the real cell.
+    out = find_open_days(lbls, TODAY, 7)
+    assert [s["date"] for s in out] == [date(2026, 6, 18)]
 
 
-def test_dedupes_repeated_timestamps():
-    t = ms(NOW + timedelta(days=1))
-    body = f"[{t},{t},{t}]"
-    assert extract_epoch_slots(body, max_days=7) == {t}
+def test_parse_label_date_named_month():
+    assert parse_label_date("July 1, Wednesday, no available times", TODAY) == date(2026, 7, 1)
 
 
-def test_empty_body():
-    assert extract_epoch_slots("", max_days=7) == set()
+def test_parse_label_date_bare_day_uses_current_month():
+    assert parse_label_date("18, Thursday, 3 available times", TODAY) == date(2026, 6, 18)
+
+
+def test_parse_label_date_dec_to_jan_rollover():
+    dec = date(2026, 12, 30)
+    assert parse_label_date("January 2, Friday, no available times", dec) == date(2027, 1, 2)
 
 
 if __name__ == "__main__":
-    # Allows running without pytest: `python test_check_slots.py`
     failures = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

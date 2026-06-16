@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""Check a Google appointment-schedule page for open slots in the next 7 days.
+"""Check a Google appointment-schedule page for open days in the next 7 days.
 
-Loads the JS-rendered booking page with headless Chromium (Playwright),
-scrapes the available time-slot buttons, keeps only those within the next
-7 days, and pushes a phone notification via ntfy.sh when any are found.
+Loads the JS-rendered booking page with headless Chromium (Playwright) and
+reads the calendar grid. Each day cell carries an accessibility label that
+says either "...no available times" or "...available times"; we use that
+signal (it mirrors exactly what a human sees) to decide which days within the
+window are bookable, and push a phone notification via ntfy.sh when any are.
 
-Designed to run unattended on GitHub Actions. Configuration comes from
-environment variables:
+Why day-level, not exact time slots: Google only emits a real per-slot
+availability payload once a day with openings is selected, so there is nothing
+reliable to scrape when everything is full. The day-cell aria-labels are
+present and meaningful in every state, which makes them the dependable signal.
+When a day is open, the notification links you straight to the page to pick a
+time.
+
+Designed to run unattended on GitHub Actions. Configuration via env vars:
 
     NTFY_TOPIC   (required)  the ntfy.sh topic to POST notifications to
     BOOKING_URL  (optional)  override the default appointment page
     DAYS_AHEAD   (optional)  how many days out to look (default 7)
     NTFY_SERVER  (optional)  ntfy server base URL (default https://ntfy.sh)
 
-Exit codes: always 0 on a successful run (slots found or not). Non-zero
-only if the page failed to load / scrape so the Actions run shows red.
+Exit codes: 0 on a successful run (open days found or not). Non-zero only if
+the page failed to load / no day cells were found, so the Actions run shows red.
 """
 
 from __future__ import annotations
@@ -22,10 +30,10 @@ from __future__ import annotations
 import os
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
 # Note: `requests` and `playwright` are imported lazily inside the functions
-# that use them (notify / scrape_slots) so the pure parsing helpers can be
+# that use them (notify / scrape_open_days) so the pure parsing helpers can be
 # imported and unit-tested without a browser or those deps installed.
 
 DEFAULT_URL = (
@@ -33,128 +41,92 @@ DEFAULT_URL = (
     "AcZssZ2G7NhnN1uaunypuOaF8ScIntvaClqZIMRjkSp8m5n3J_BgA4a3_w5Cvv-_O0-NRU_DrQLGgx9d"
 )
 
-# ---------------------------------------------------------------------------
-# !! KNOWN ISSUE !!  The selectors below are *guesses* against Google's
-# obfuscated markup. After the first real run, open the GitHub Actions log,
-# read the "DOM DUMP" section this script prints, and correct these to match
-# the actual rendered DOM. See README.md "Fixing the selectors".
-# ---------------------------------------------------------------------------
+# A day cell's aria-label always ends with "<N> available times" or
+# "no available times" (verified against the live page). These two markers are
+# how we tell a calendar day apart from nav buttons and whether it's open.
+DAY_MARKER = "available times"
+CLOSED_MARKER = "no available times"
 
-# Candidate selectors for clickable available-slot buttons, tried in order.
-SLOT_SELECTORS = [
-    "button[data-slot-time]",
-    "button[jsname][aria-label*=':']",
-    "div[role='button'][data-datetime]",
-    "[data-time-slot]",
-    "button[aria-label*='AM'], button[aria-label*='PM']",
-]
+MONTHS = {
+    m: i
+    for i, m in enumerate(
+        [
+            "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        ],
+        start=1,
+    )
+}
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def parse_slot_datetime(raw: str) -> datetime | None:
-    """Best-effort parse of a slot label/attribute into an aware datetime.
+def parse_label_date(label: str, today: date) -> date | None:
+    """Parse a calendar day-cell aria-label into a date (fallback path).
 
-    Google exposes slot times in a few shapes depending on the widget; we try
-    the common ones. Returns None if nothing parses (caller decides what to do).
+    Handles both "July 1, Wednesday, no available times" (month named) and
+    "16, Tuesday, today, no available times" (current month, bare day number).
+    Used only when the 'today' cell can't be located to anchor by position.
     """
-    raw = raw.strip()
-    if not raw:
-        return None
-
-    # 1) ISO-8601 (e.g. data-datetime="2026-06-18T14:30:00-07:00")
-    iso = raw.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        pass
-
-    # 2) Unix epoch milliseconds (common in data-* attributes)
-    if re.fullmatch(r"\d{10,13}", raw):
-        ts = int(raw)
-        if len(raw) >= 13:
-            ts //= 1000
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-
-    # 3) Human label like "Thu, Jun 18, 2:30 PM" or "June 18, 2026 2:30 PM"
-    for fmt in (
-        "%a, %b %d, %I:%M %p",
-        "%A, %B %d, %Y %I:%M %p",
-        "%B %d, %Y %I:%M %p",
-        "%b %d, %Y, %I:%M %p",
-        "%Y-%m-%d %H:%M",
-    ):
+    low = label.lower()
+    # "Month D, ..."  -> month is named explicitly
+    m = re.match(r"\s*([a-z]+)\s+(\d{1,2})\b", low)
+    if m and m.group(1) in MONTHS:
+        month, day = MONTHS[m.group(1)], int(m.group(2))
+        year = today.year
+        # Calendar shows a few months around 'now'; pick the year that puts
+        # this month nearest today (handles a Dec->Jan rollover).
+        candidate = date(year, month, day)
+        if (candidate - today).days < -180:
+            candidate = date(year + 1, month, day)
+        return candidate
+    # "D, ..." -> bare day number, assume the current month being viewed
+    m = re.match(r"\s*(\d{1,2})\b", low)
+    if m:
+        day = int(m.group(1))
         try:
-            dt = datetime.strptime(raw, fmt)
-            if dt.year == 1900:  # format had no year -> assume current/next
-                now = datetime.now()
-                dt = dt.replace(year=now.year)
-                if dt < now - timedelta(days=1):
-                    dt = dt.replace(year=now.year + 1)
-            return dt.replace(tzinfo=timezone.utc)
+            return date(today.year, today.month, day)
         except ValueError:
-            continue
-
+            return None
     return None
 
 
-def extract_epoch_slots(body: str, max_days: int) -> set[int]:
-    """Pull plausible slot-start epoch-millisecond values out of a raw payload.
+def find_open_days(day_labels: list[str], today: date, days_ahead: int) -> list[dict]:
+    """Given the ordered calendar day-cell aria-labels, return open days in window.
 
-    Google's availability RPC returns slot times as 13-digit epoch-ms integers
-    embedded in an array-of-arrays response. Rather than depend on the exact
-    nesting (which can shift), we scan for 13-digit integers that land in a
-    sensible future window. This is the one thing to sanity-check on the first
-    run — but it keys off a stable data contract, not rotating CSS hashes.
+    Anchors dates off the cell flagged "today" and counts by position (robust to
+    locale and missing month names); falls back to parsing labels if no 'today'
+    cell is present. A day is "open" when its label lacks the CLOSED_MARKER.
+    Returns [{'date': date, 'label': str}, ...] sorted by date.
     """
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    lo = now_ms - 6 * 3600 * 1000          # tolerate slightly-past / tz skew
-    hi = now_ms + max_days * 86400 * 1000
-    out: set[int] = set()
-    for m in re.findall(r"\b\d{13}\b", body):
-        ms = int(m)
-        if lo <= ms <= hi:
-            out.add(ms)
+    today_idx = next((i for i, l in enumerate(day_labels) if "today" in l.lower()), None)
+
+    out: list[dict] = []
+    for i, label in enumerate(day_labels):
+        low = label.lower()
+        if DAY_MARKER not in low:
+            continue  # not a day cell
+        if today_idx is not None:
+            d = today + timedelta(days=i - today_idx)
+        else:
+            d = parse_label_date(label, today)
+            if d is None:
+                continue
+        delta = (d - today).days
+        if 0 <= delta <= days_ahead and CLOSED_MARKER not in low:
+            out.append({"date": d, "label": label})
+    out.sort(key=lambda s: s["date"])
     return out
 
 
-def scrape_slots(url: str) -> tuple[list[dict], str]:
-    """Return (slots, dom_dump). Each slot is {'label', 'raw', 'dt'}.
-
-    dom_dump is a trimmed snapshot of candidate elements, printed to the log
-    so selectors can be corrected after the first run.
-    """
+def scrape_open_days(url: str, today: date, days_ahead: int) -> tuple[list[dict], int, str]:
+    """Load the page and return (open_days, total_day_cells, debug_text)."""
     from playwright.sync_api import sync_playwright
 
-    slots: list[dict] = []
-    debug_parts: list[str] = []
-
-    # Responses captured for inspection: (url, status, body). The booking
-    # widget fetches availability via a background RPC to calendar.google.com;
-    # reading that structured payload is far more stable than scraping the
-    # obfuscated DOM, whose class/jsname hashes rotate on Google's deploys.
-    captured: list[tuple[str, int, str]] = []
-
-    def on_response(resp) -> None:
-        try:
-            url_l = resp.url
-            if "calendar.google.com" not in url_l:
-                return
-            # Availability comes back from these RPC endpoints. We don't hard-
-            # code an exact rpcid (those can change); we keep any calendar
-            # response whose body carries future epoch-ms timestamps.
-            if not any(k in url_l for k in ("batchexecute", "GetCatalog", "schedules")):
-                return
-            body = resp.text()
-            if extract_epoch_slots(body, max_days=90):
-                captured.append((url_l, resp.status, body))
-        except Exception:
-            pass  # body not available (e.g. redirect) — ignore
+    debug: list[str] = []
+    day_labels: list[str] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -164,105 +136,41 @@ def scrape_slots(url: str) -> tuple[list[dict], str]:
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        page.on("response", on_response)
-
         log(f"Loading {url}")
         page.goto(url, wait_until="networkidle", timeout=60000)
-        # Give the booking widget time to fire its availability RPC and hydrate.
         page.wait_for_timeout(6000)
 
-        # ---- Primary path: structured timestamps from the captured RPC ----
-        epochs: set[int] = set()
-        debug_parts.append("===== CAPTURED CALENDAR RESPONSES =====")
-        if captured:
-            for u, status, body in captured:
-                found = extract_epoch_slots(body, max_days=90)
-                epochs.update(found)
-                debug_parts.append(f"  [{status}] {len(found)} epoch(s) <- {u[:120]}")
-        else:
-            debug_parts.append("  (none — no calendar response carried future timestamps)")
-        debug_parts.append("===== END CAPTURED RESPONSES =====")
-
-        for ms in sorted(epochs):
-            dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-            slots.append({"label": "", "raw": str(ms), "dt": dt})
-
-        # ---- Fallback path: DOM scraping (only if the RPC gave us nothing) --
-        if not slots:
-            debug_parts.append("Network capture empty; falling back to DOM scraping.")
-            for sel in SLOT_SELECTORS:
-                try:
-                    count = page.locator(sel).count()
-                except Exception:
-                    count = 0
-                if count:
-                    log(f"Selector matched {count} element(s): {sel}")
-                    handles = page.locator(sel).element_handles()
-                    for h in handles:
-                        label = (h.get_attribute("aria-label") or h.inner_text() or "").strip()
-                        raw = (
-                            h.get_attribute("data-datetime")
-                            or h.get_attribute("data-slot-time")
-                            or h.get_attribute("data-time-slot")
-                            or label
-                        )
-                        slots.append({"label": label, "raw": raw, "dt": parse_slot_datetime(raw)})
-                    if slots:
-                        break
-
-            debug_parts.append("===== DOM DUMP (selector fallback) =====")
-            try:
-                buttons = page.locator("button, div[role='button']").element_handles()[:60]
-                for b in buttons:
-                    al = (b.get_attribute("aria-label") or "").strip()
-                    txt = (b.inner_text() or "").strip().replace("\n", " ")[:60]
-                    jn = b.get_attribute("jsname") or ""
-                    if al or txt:
-                        debug_parts.append(f"  jsname={jn!r} aria={al!r} text={txt!r}")
-            except Exception as e:  # pragma: no cover - debugging aid only
-                debug_parts.append(f"  (dom dump failed: {e})")
-            debug_parts.append("===== END DOM DUMP =====")
+        handles = page.locator("button, div[role='button'], [role='gridcell']").element_handles()
+        for h in handles:
+            al = (h.get_attribute("aria-label") or "").strip()
+            if DAY_MARKER in al.lower():
+                day_labels.append(al)
 
         browser.close()
 
-    return slots, "\n".join(debug_parts)
+    open_days = find_open_days(day_labels, today, days_ahead)
+
+    debug.append(f"===== CALENDAR SCAN ({len(day_labels)} day cells) =====")
+    for label in day_labels:
+        flag = "OPEN " if CLOSED_MARKER not in label.lower() else "     "
+        debug.append(f"  {flag}{label}")
+    debug.append("===== END CALENDAR SCAN =====")
+
+    return open_days, len(day_labels), "\n".join(debug)
 
 
-def filter_upcoming(slots: list[dict], days_ahead: int) -> list[dict]:
-    now = datetime.now(timezone.utc)
-    horizon = now + timedelta(days=days_ahead)
-    upcoming = []
-    for s in slots:
-        dt = s["dt"]
-        if dt is None:
-            # Unparseable time but a real slot button -> include it so we don't
-            # silently miss openings; the notification shows the raw label.
-            upcoming.append(s)
-            continue
-        if now - timedelta(hours=1) <= dt <= horizon:
-            upcoming.append(s)
-    return upcoming
-
-
-def notify(topic: str, server: str, slots: list[dict], url: str) -> None:
+def notify(topic: str, server: str, open_days: list[dict], url: str) -> None:
     import requests
 
-    lines = []
-    for s in slots[:20]:
-        if s["dt"] is not None:
-            lines.append("• " + s["dt"].strftime("%a %b %d, %I:%M %p"))
-        elif s["label"]:
-            lines.append("• " + s["label"])
-        else:
-            lines.append("• (open slot)")
-    body = "Open appointment slots found:\n" + "\n".join(lines) + f"\n\nBook: {url}"
+    lines = ["• " + s["date"].strftime("%a %b %d") for s in open_days]
+    body = "Open appointment day(s) found:\n" + "\n".join(lines) + f"\n\nBook: {url}"
 
     endpoint = f"{server.rstrip('/')}/{topic}"
     resp = requests.post(
         endpoint,
         data=body.encode("utf-8"),
         headers={
-            "Title": f"{len(slots)} appointment slot(s) open",
+            "Title": f"{len(open_days)} day(s) with open appointments",
             "Priority": "high",
             "Tags": "calendar,bell",
             "Click": url,
@@ -282,24 +190,26 @@ def main() -> int:
     url = os.environ.get("BOOKING_URL", DEFAULT_URL)
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
     days_ahead = int(os.environ.get("DAYS_AHEAD", "7"))
+    today = date.today()
 
     try:
-        slots, dom_dump = scrape_slots(url)
+        open_days, total_cells, debug = scrape_open_days(url, today, days_ahead)
     except Exception as e:
         log(f"ERROR: failed to load/scrape page: {e}")
         return 1
 
-    log(dom_dump)
-    log(f"Scraped {len(slots)} raw slot candidate(s).")
+    log(debug)
 
-    upcoming = filter_upcoming(slots, days_ahead)
-    log(f"{len(upcoming)} slot(s) within the next {days_ahead} days.")
+    if total_cells == 0:
+        # No day cells at all means the calendar didn't render / markup changed.
+        log("ERROR: found 0 calendar day cells — page layout may have changed.")
+        return 1
 
-    if upcoming:
-        notify(topic, server, upcoming, url)
+    log(f"{len(open_days)} open day(s) within the next {days_ahead} days.")
+    if open_days:
+        notify(topic, server, open_days, url)
     else:
-        log("No open slots in window; no notification sent.")
-
+        log("No open days in window; no notification sent.")
     return 0
 
 

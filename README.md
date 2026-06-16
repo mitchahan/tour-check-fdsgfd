@@ -1,19 +1,25 @@
 # tour-check
 
 Free, fully-automated watcher for a Google appointment-schedule page. Once a
-day, GitHub Actions runs a headless-Chromium scraper, looks for open slots in
-the next 7 days, and pushes a phone notification via [ntfy.sh](https://ntfy.sh)
-when it finds any. Nothing runs on your own machine.
+day, GitHub Actions runs a headless-Chromium scraper, looks for days with open
+appointments in the next 7 days, and pushes a phone notification via
+[ntfy.sh](https://ntfy.sh) when it finds any. Nothing runs on your own machine.
 
 ## How it works
 
 - **GitHub Actions** runs `check_slots.py` on a daily cron (and on demand).
 - **Playwright (headless Chromium)** loads the JS-rendered booking page and
-  **intercepts the availability RPC** the widget fetches in the background.
-  Slot times come back as structured epoch-millisecond timestamps, which is
-  far more stable than scraping the obfuscated DOM. (DOM scraping is kept only
-  as a fallback if no usable network response is captured.)
-- The script keeps slots within the next 7 days and **POSTs to a free
+  reads the **calendar grid's accessibility labels**. Each day cell says either
+  "…no available times" or "…N available times" — the same signal a human sees.
+  We anchor dates off the cell marked "today" and report any day within the
+  window whose label lacks "no available times".
+- This was chosen over scraping obfuscated CSS classes (which rotate on
+  Google's deploys) **and** over parsing the background availability RPC: when
+  nothing is open, Google sends no real slot payload, so there's nothing
+  dependable to parse. The aria-labels are present and meaningful in every
+  state. Detection is **day-level** — the notification links you to the page to
+  pick an exact time.
+- The script reports open days within the next 7 days and **POSTs to a free
   ntfy.sh topic** that your phone subscribes to.
 - The repo is **public**, so Actions minutes are free.
 
@@ -30,7 +36,7 @@ when it finds any. Nothing runs on your own machine.
    "Subscribe to topic", and enter the exact same topic string.
 5. **Test it**: repo → Actions → "Check appointment slots" → "Run workflow".
    Watch the run log, and confirm a notification arrives (or that the log
-   reports zero slots cleanly).
+   reports zero open days cleanly).
 
 ## Configuration
 
@@ -47,25 +53,23 @@ The cron time lives in `.github/workflows/check.yml` (`0 13 * * *`, UTC).
 
 ## ⚠️ Known issues to be aware of
 
-### 1. Verify the captured timestamps once after the first run
-The script prefers structured data: it intercepts the calendar availability
-RPC and pulls out 13-digit epoch-ms timestamps that fall in a future window
-(`extract_epoch_slots` in `check_slots.py`). This keys off a **stable data
-contract** rather than rotating CSS class/`jsname` hashes, so it shouldn't
-break on Google's routine UI redeploys.
+### 1. The "open" wording is inferred — confirm it on the first real opening
+Detection was verified against the live page **while everything was full**: all
+42 day cells read "no available times" and the script correctly reported zero
+(see the `===== CALENDAR SCAN =====` block in the run log, which lists every
+day cell and flags open ones with `OPEN`).
 
-There is still one sanity-check to do on the first run:
-1. Run the workflow once (manually).
-2. Open the run log and find **`===== CAPTURED CALENDAR RESPONSES =====`**.
-   - If it lists endpoints with a sensible epoch count, you're done — the
-     count should roughly match the open slots actually shown on the page.
-   - If it says **(none)**, the script fell back to DOM scraping and printed a
-     **`===== DOM DUMP =====`**; tighten the matching there, or narrow the URL
-     filter / epoch heuristic in `scrape_slots` to the real RPC you see logged.
-3. Commit and re-run.
+What hasn't been seen on the real page yet is the exact label text when a day
+*does* have openings. The code assumes an open day's label contains
+"available times" **without** the "no" prefix (e.g. "Thu Jun 18, 3 available
+times") — a safe reading of the observed pattern, but unconfirmed. The first
+time a day actually opens, check the CALENDAR SCAN log: the open day should
+show the `OPEN` flag and you should get a notification. If a known-open day is
+*not* flagged, adjust `CLOSED_MARKER` / `DAY_MARKER` at the top of
+`check_slots.py` to match the real wording.
 
-Once the captured endpoint is confirmed, no per-deploy selector maintenance is
-expected — unlike pure DOM scraping.
+Note this is **day-level** detection by design (see "How it works"); it tells
+you which days have openings, not the exact times — tap through to book.
 
 ### 2. GitHub disables scheduled workflows after 60 days of inactivity
 If the repo sees **no commits/activity for 60 days**, GitHub automatically
