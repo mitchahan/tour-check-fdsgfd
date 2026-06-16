@@ -8,9 +8,13 @@ when it finds any. Nothing runs on your own machine.
 ## How it works
 
 - **GitHub Actions** runs `check_slots.py` on a daily cron (and on demand).
-- **Playwright (headless Chromium)** loads the JS-rendered booking page.
-- The script scrapes available slot buttons, keeps those within the next 7
-  days, and **POSTs to a free ntfy.sh topic** that your phone subscribes to.
+- **Playwright (headless Chromium)** loads the JS-rendered booking page and
+  **intercepts the availability RPC** the widget fetches in the background.
+  Slot times come back as structured epoch-millisecond timestamps, which is
+  far more stable than scraping the obfuscated DOM. (DOM scraping is kept only
+  as a fallback if no usable network response is captured.)
+- The script keeps slots within the next 7 days and **POSTs to a free
+  ntfy.sh topic** that your phone subscribes to.
 - The repo is **public**, so Actions minutes are free.
 
 ## One-time setup
@@ -43,18 +47,25 @@ The cron time lives in `.github/workflows/check.yml` (`0 13 * * *`, UTC).
 
 ## ⚠️ Known issues to be aware of
 
-### 1. The slot selectors are guesses — fix them after the first run
-Google's booking markup is heavily obfuscated, so the CSS selectors in
-`SLOT_SELECTORS` (top of `check_slots.py`) are **best-effort guesses**. They
-may match nothing on the first run.
+### 1. Verify the captured timestamps once after the first run
+The script prefers structured data: it intercepts the calendar availability
+RPC and pulls out 13-digit epoch-ms timestamps that fall in a future window
+(`extract_epoch_slots` in `check_slots.py`). This keys off a **stable data
+contract** rather than rotating CSS class/`jsname` hashes, so it shouldn't
+break on Google's routine UI redeploys.
 
-To fix them:
+There is still one sanity-check to do on the first run:
 1. Run the workflow once (manually).
-2. Open the run log and find the **`===== DOM DUMP =====`** section. It lists
-   the real buttons on the page with their `jsname`, `aria-label`, and text.
-3. Identify which elements are actual time slots and update `SLOT_SELECTORS`
-   (and, if needed, the attribute names read in `scrape_slots`) to match.
-4. Commit and re-run.
+2. Open the run log and find **`===== CAPTURED CALENDAR RESPONSES =====`**.
+   - If it lists endpoints with a sensible epoch count, you're done — the
+     count should roughly match the open slots actually shown on the page.
+   - If it says **(none)**, the script fell back to DOM scraping and printed a
+     **`===== DOM DUMP =====`**; tighten the matching there, or narrow the URL
+     filter / epoch heuristic in `scrape_slots` to the real RPC you see logged.
+3. Commit and re-run.
+
+Once the captured endpoint is confirmed, no per-deploy selector maintenance is
+expected — unlike pure DOM scraping.
 
 ### 2. GitHub disables scheduled workflows after 60 days of inactivity
 If the repo sees **no commits/activity for 60 days**, GitHub automatically

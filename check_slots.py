@@ -102,6 +102,26 @@ def parse_slot_datetime(raw: str) -> datetime | None:
     return None
 
 
+def extract_epoch_slots(body: str, max_days: int) -> set[int]:
+    """Pull plausible slot-start epoch-millisecond values out of a raw payload.
+
+    Google's availability RPC returns slot times as 13-digit epoch-ms integers
+    embedded in an array-of-arrays response. Rather than depend on the exact
+    nesting (which can shift), we scan for 13-digit integers that land in a
+    sensible future window. This is the one thing to sanity-check on the first
+    run — but it keys off a stable data contract, not rotating CSS hashes.
+    """
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    lo = now_ms - 6 * 3600 * 1000          # tolerate slightly-past / tz skew
+    hi = now_ms + max_days * 86400 * 1000
+    out: set[int] = set()
+    for m in re.findall(r"\b\d{13}\b", body):
+        ms = int(m)
+        if lo <= ms <= hi:
+            out.add(ms)
+    return out
+
+
 def scrape_slots(url: str) -> tuple[list[dict], str]:
     """Return (slots, dom_dump). Each slot is {'label', 'raw', 'dt'}.
 
@@ -109,7 +129,29 @@ def scrape_slots(url: str) -> tuple[list[dict], str]:
     so selectors can be corrected after the first run.
     """
     slots: list[dict] = []
-    dom_dump_parts: list[str] = []
+    debug_parts: list[str] = []
+
+    # Responses captured for inspection: (url, status, body). The booking
+    # widget fetches availability via a background RPC to calendar.google.com;
+    # reading that structured payload is far more stable than scraping the
+    # obfuscated DOM, whose class/jsname hashes rotate on Google's deploys.
+    captured: list[tuple[str, int, str]] = []
+
+    def on_response(resp) -> None:
+        try:
+            url_l = resp.url
+            if "calendar.google.com" not in url_l:
+                return
+            # Availability comes back from these RPC endpoints. We don't hard-
+            # code an exact rpcid (those can change); we keep any calendar
+            # response whose body carries future epoch-ms timestamps.
+            if not any(k in url_l for k in ("batchexecute", "GetCatalog", "schedules")):
+                return
+            body = resp.text()
+            if extract_epoch_slots(body, max_days=90):
+                captured.append((url_l, resp.status, body))
+        except Exception:
+            pass  # body not available (e.g. redirect) — ignore
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -119,49 +161,68 @@ def scrape_slots(url: str) -> tuple[list[dict], str]:
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         )
+        page.on("response", on_response)
+
         log(f"Loading {url}")
         page.goto(url, wait_until="networkidle", timeout=60000)
-        # Give the booking widget time to hydrate.
-        page.wait_for_timeout(5000)
+        # Give the booking widget time to fire its availability RPC and hydrate.
+        page.wait_for_timeout(6000)
 
-        # Try to surface any "next available" / load buttons that reveal slots.
-        for sel in SLOT_SELECTORS:
+        # ---- Primary path: structured timestamps from the captured RPC ----
+        epochs: set[int] = set()
+        debug_parts.append("===== CAPTURED CALENDAR RESPONSES =====")
+        if captured:
+            for u, status, body in captured:
+                found = extract_epoch_slots(body, max_days=90)
+                epochs.update(found)
+                debug_parts.append(f"  [{status}] {len(found)} epoch(s) <- {u[:120]}")
+        else:
+            debug_parts.append("  (none — no calendar response carried future timestamps)")
+        debug_parts.append("===== END CAPTURED RESPONSES =====")
+
+        for ms in sorted(epochs):
+            dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+            slots.append({"label": "", "raw": str(ms), "dt": dt})
+
+        # ---- Fallback path: DOM scraping (only if the RPC gave us nothing) --
+        if not slots:
+            debug_parts.append("Network capture empty; falling back to DOM scraping.")
+            for sel in SLOT_SELECTORS:
+                try:
+                    count = page.locator(sel).count()
+                except Exception:
+                    count = 0
+                if count:
+                    log(f"Selector matched {count} element(s): {sel}")
+                    handles = page.locator(sel).element_handles()
+                    for h in handles:
+                        label = (h.get_attribute("aria-label") or h.inner_text() or "").strip()
+                        raw = (
+                            h.get_attribute("data-datetime")
+                            or h.get_attribute("data-slot-time")
+                            or h.get_attribute("data-time-slot")
+                            or label
+                        )
+                        slots.append({"label": label, "raw": raw, "dt": parse_slot_datetime(raw)})
+                    if slots:
+                        break
+
+            debug_parts.append("===== DOM DUMP (selector fallback) =====")
             try:
-                count = page.locator(sel).count()
-            except Exception:
-                count = 0
-            if count:
-                log(f"Selector matched {count} element(s): {sel}")
-                handles = page.locator(sel).element_handles()
-                for h in handles:
-                    label = (h.get_attribute("aria-label") or h.inner_text() or "").strip()
-                    raw = (
-                        h.get_attribute("data-datetime")
-                        or h.get_attribute("data-slot-time")
-                        or h.get_attribute("data-time-slot")
-                        or label
-                    )
-                    slots.append({"label": label, "raw": raw, "dt": parse_slot_datetime(raw)})
-                if slots:
-                    break  # first selector that produced slots wins
-
-        # Always capture a DOM snapshot of likely-relevant nodes for debugging.
-        dom_dump_parts.append("===== DOM DUMP (for fixing selectors) =====")
-        try:
-            buttons = page.locator("button, div[role='button']").element_handles()[:60]
-            for b in buttons:
-                al = (b.get_attribute("aria-label") or "").strip()
-                txt = (b.inner_text() or "").strip().replace("\n", " ")[:60]
-                jn = b.get_attribute("jsname") or ""
-                if al or txt:
-                    dom_dump_parts.append(f"  jsname={jn!r} aria={al!r} text={txt!r}")
-        except Exception as e:  # pragma: no cover - debugging aid only
-            dom_dump_parts.append(f"  (dom dump failed: {e})")
-        dom_dump_parts.append("===== END DOM DUMP =====")
+                buttons = page.locator("button, div[role='button']").element_handles()[:60]
+                for b in buttons:
+                    al = (b.get_attribute("aria-label") or "").strip()
+                    txt = (b.inner_text() or "").strip().replace("\n", " ")[:60]
+                    jn = b.get_attribute("jsname") or ""
+                    if al or txt:
+                        debug_parts.append(f"  jsname={jn!r} aria={al!r} text={txt!r}")
+            except Exception as e:  # pragma: no cover - debugging aid only
+                debug_parts.append(f"  (dom dump failed: {e})")
+            debug_parts.append("===== END DOM DUMP =====")
 
         browser.close()
 
-    return slots, "\n".join(dom_dump_parts)
+    return slots, "\n".join(debug_parts)
 
 
 def filter_upcoming(slots: list[dict], days_ahead: int) -> list[dict]:
