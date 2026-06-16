@@ -24,8 +24,9 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
-import requests
-from playwright.sync_api import sync_playwright
+# Note: `requests` and `playwright` are imported lazily inside the functions
+# that use them (notify / scrape_slots) so the pure parsing helpers can be
+# imported and unit-tested without a browser or those deps installed.
 
 DEFAULT_URL = (
     "https://calendar.google.com/calendar/u/0/appointments/schedules/"
@@ -128,6 +129,8 @@ def scrape_slots(url: str) -> tuple[list[dict], str]:
     dom_dump is a trimmed snapshot of candidate elements, printed to the log
     so selectors can be corrected after the first run.
     """
+    from playwright.sync_api import sync_playwright
+
     slots: list[dict] = []
     debug_parts: list[str] = []
 
@@ -242,6 +245,8 @@ def filter_upcoming(slots: list[dict], days_ahead: int) -> list[dict]:
 
 
 def notify(topic: str, server: str, slots: list[dict], url: str) -> None:
+    import requests
+
     lines = []
     for s in slots[:20]:
         if s["dt"] is not None:
