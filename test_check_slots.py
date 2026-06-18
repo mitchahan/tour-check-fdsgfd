@@ -12,10 +12,12 @@ TODAY = date(2026, 6, 16)  # Tuesday, matching the live snapshot
 
 
 def labels(*pairs):
-    """Build day-cell labels from (text, open?) pairs."""
-    return [
-        f"{t}, {'3 available times' if o else 'no available times'}" for t, o in pairs
-    ]
+    """Build day-cell labels from (text, open?) pairs.
+
+    Matches the real live-page wording: closed days carry a ", no available
+    times" suffix; open days are just "<day>, <weekday>" with no suffix.
+    """
+    return [(f"{t}, no available times" if not o else t) for t, o in pairs]
 
 
 # ---- cell_date: dating a label against the displayed month/year ----
@@ -50,14 +52,31 @@ def test_parse_open_days_all_closed():
 
 
 def test_parse_open_days_finds_open_sorted():
-    lbls = labels(("20, Saturday", True), ("18, Thursday", True), ("17, Wed", False))
+    lbls = labels(("20, Saturday", True), ("18, Thursday", True), ("17, Wednesday", False))
     out = parse_open_days(lbls, 6, 2026)
     assert [s["date"] for s in out] == [date(2026, 6, 18), date(2026, 6, 20)]
 
 
+def test_parse_open_days_real_wording():
+    # Exact labels captured from the live page when slots opened up.
+    lbls = [
+        "June 28, Sunday, no available times",
+        "8, Wednesday",          # open (July 8, displayed month = July)
+        "9, Thursday, no available times",
+        "August 4, Tuesday",     # open
+    ]
+    out = parse_open_days(lbls, 7, 2026)
+    assert [s["date"] for s in out] == [date(2026, 7, 8), date(2026, 8, 4)]
+
+
+def test_nav_buttons_not_treated_as_days():
+    for junk in ("Next month", "Previous day", "Jump to the next bookable date"):
+        assert parse_open_days([junk], 7, 2026) == []
+
+
 def test_parse_open_days_undatable_open_kept_last():
-    # An open cell we can't date still surfaces (fail-open), sorted to the end.
-    lbls = ["mystery layout, 1 available times"] + labels(("18, Thursday", True))
+    # An open day cell with an impossible date still surfaces (fail-open), last.
+    lbls = ["35, Monday"] + labels(("18, Thursday", True))
     out = parse_open_days(lbls, 6, 2026)
     assert out[0]["date"] == date(2026, 6, 18)
     assert out[1]["date"] is None

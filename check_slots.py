@@ -43,10 +43,17 @@ DEFAULT_URL = (
     "AcZssZ2G7NhnN1uaunypuOaF8ScIntvaClqZIMRjkSp8m5n3J_BgA4a3_w5Cvv-_O0-NRU_DrQLGgx9d"
 )
 
-# A day cell's aria-label ends with "<N> available times" or "no available
-# times" (verified on the live page). These markers identify a day cell and
-# tell open from closed.
-DAY_MARKER = "available times"
+# Day-cell aria-labels (verified against the live page in both states):
+#   closed -> "16, Tuesday, no available times" / "August 8, Saturday, no available times"
+#   open   -> "8, Wednesday" / "August 4, Tuesday"   (no availability suffix at all)
+# So we identify a day cell by its "<day>, <weekday>" shape (optionally prefixed
+# with a month name), and treat the absence of CLOSED_MARKER as open. Keying on
+# the word "available" would miss open days entirely.
+DAY_CELL_RX = re.compile(
+    r"^\s*(?:[a-z]+\s+)?\d{1,2},\s+"
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.I,
+)
 CLOSED_MARKER = "no available times"
 # Google renders this exact phrase (only after the jump) when the entire
 # schedule is empty — a reliable "genuinely fully booked" signal.
@@ -106,8 +113,7 @@ def parse_open_days(day_labels: list[str], disp_month: int, disp_year: int) -> l
     """
     out: list[dict] = []
     for label in day_labels:
-        low = label.lower()
-        if DAY_MARKER not in low or CLOSED_MARKER in low:
+        if not DAY_CELL_RX.match(label) or CLOSED_MARKER in label.lower():
             continue
         out.append({"date": cell_date(label, disp_month, disp_year), "label": label})
     out.sort(key=lambda s: (s["date"] is None, s["date"] or date.max))
@@ -168,7 +174,7 @@ def scrape(url: str) -> dict:
         day_labels = []
         for h in page.locator("button, div[role='button'], [role='gridcell']").element_handles():
             al = (h.get_attribute("aria-label") or "").strip()
-            if DAY_MARKER in al.lower():
+            if DAY_CELL_RX.match(al):
                 day_labels.append(al)
 
         browser.close()

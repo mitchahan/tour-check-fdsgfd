@@ -57,24 +57,23 @@ The cron time lives in `.github/workflows/check.yml` (`0 13 * * *`, UTC).
 
 ## ⚠️ Known issues to be aware of
 
-### 1. The "open day" path is inferred — confirm it on the first real opening
-Detection was verified against the live page **while it was fully booked**:
-clicking the jump control produced "No available times in the next year", all
-42 day cells read "no available times", and the script correctly sent nothing
-(see the `===== CALENDAR SCAN =====` block in the run log, which lists every
-day cell and flags open ones with `OPEN`).
+### 1. Detection is verified in BOTH states, but stays day-level
+Detection has now been confirmed against the live page both fully booked and
+with real openings:
+- **Fully booked:** the jump control renders "No available times in the next
+  year" and every day cell reads "…no available times" → no notification.
+- **Open:** open day cells carry *no* availability suffix at all — just
+  "8, Wednesday" or "August 4, Tuesday" — while closed cells end with ", no
+  available times". The script identifies a day cell by its "<day>, <weekday>"
+  shape and treats the absence of "no available times" as open. (Confirmed: it
+  correctly flagged July 8 + Aug 4–7 and notified for the one inside the
+  window.)
 
-What couldn't be observed (there was no opening anywhere in the next year) is
-the exact label text and grid layout when a day *does* open. The code assumes
-an open day's label contains "available times" **without** the "no" prefix
-(e.g. "Thu Jun 18, 3 available times") — a safe reading, but unconfirmed.
-Two safety nets cover the gap until then:
-- **Fail-open:** if availability is detected but no date parses, you still get
-  a "Possible appointment opening (verify)" notification with the raw label.
-- The **CALENDAR SCAN** log always shows what the script saw. The first time a
-  day opens, confirm it's flagged `OPEN` and that a notification fires; if a
-  known-open day isn't flagged, adjust `CLOSED_MARKER` / `DAY_MARKER` at the
-  top of `check_slots.py` to match the real wording.
+Remaining safety net: if an opening is detected but its date can't be parsed
+(an unfamiliar layout), the script **fails open** with a "Possible appointment
+opening (verify)" notification carrying the raw label. The `===== CALENDAR
+SCAN =====` block in every run log shows exactly what was seen, flagging open
+days with `OPEN`.
 
 Note this is **day-level** detection by design (see "How it works") — it tells
 you which day has openings, not the exact times; tap through to book.
